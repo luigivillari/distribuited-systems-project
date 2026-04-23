@@ -1,0 +1,756 @@
+"""
+phase4_experiments.py
+=====================
+Fase 4 — Experimentation & Evaluation
+
+Esegue 4 scenari sperimentali e misura le 4 metriche del progetto:
+  1. Placement Latency       — tempo totale per piazzare un task (ms)
+  2. A2A Protocol Overhead   — tempo della sola fase di negoziazione (ms)
+  3. SLA Violation Rate      — % task piazzati fuori dai requisiti di latenza
+  4. CRDT Convergence Time   — tempo perché tutti i nodi si allineino (ms)
+
+Scenari:
+  S1 — Baseline          : carico normale, rete stabile
+  S2 — High Load         : burst di 20 task simultanei, nodi saturi
+  S3 — Node Failure      : un nodo va offline durante la negoziazione
+  S4 — Network Partition : cluster diviso in 2 isole, poi riconnessione
+
+Output:
+  results/raw_results.json   — dati grezzi di tutti gli esperimenti
+  results/plot_*.png         — un grafico per ciascuna metrica
+  results/summary.png        — dashboard riepilogativa 2x2
+
+Esecuzione:
+  cd src/
+  python phase4_experiments.py
+"""
+
+import ray
+import time
+import json
+import os
+import random
+import copy
+from typing import List, Dict, Any
+
+import matplotlib
+matplotlib.use("Agg")          # backend non-interattivo (funziona senza display)
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+
+from protocol import TaskRequirements, PlacementPolicy, MessageType, make_cfp, score_offer
+from agents import ResourceAgent, TaskAgent
+from crdt_catalogue import ResourceCatalogue
+
+# ─────────────────────────────────────────────
+# Configurazione globale
+# ─────────────────────────────────────────────
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+EDGE_NODES = [
+    ("edge-node-1",  8.0, 4096,  15.0, 0.3),
+    ("edge-node-2",  4.0, 2048,  40.0, 0.5),
+    ("edge-node-3",  2.0, 1024,  80.0, 0.2),
+    ("edge-node-4", 16.0, 8192,  25.0, 0.8),
+]
+
+# Colori per i 4 scenari (consistenti in tutti i grafici)
+SCENARIO_COLORS = {
+    "S1 Baseline":        "#2E86AB",
+    "S2 High Load":       "#E84855",
+    "S3 Node Failure":    "#F9A825",
+    "S4 Net Partition":   "#43AA8B",
+}
+
+SCENARIOS = list(SCENARIO_COLORS.keys())
+
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def make_resource_agents():
+    """Crea e registra 4 ResourceAgent freschi."""
+    agents = []
+    for (node_id, cpu, mem, lat, energy) in EDGE_NODES:
+        a = ResourceAgent.remote(node_id, cpu, mem, lat, energy)
+        agents.append(a)
+    time.sleep(0.3)
+    for i, agent in enumerate(agents):
+        peers = [a for j, a in enumerate(agents) if j != i]
+        agent.register_peers.remote(peers)
+    time.sleep(0.1)
+    return agents
+
+
+def run_task(task_id: str, cpu: float, mem: float, max_lat: float,
+             policy: PlacementPolicy, resource_agents: list) -> dict:
+    """
+    Esegue la negoziazione per un singolo task e ritorna il risultato
+    arricchito con timing granulare per le metriche Fase 4.
+    """
+    req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
+                           max_latency_ms=max_lat, duration_sec=10,
+                           priority=2, task_type="generic")
+
+    # ── misura A2A overhead: solo fase broadcast + raccolta risposte ──
+    cfp = make_cfp(f"task-{task_id}", task_id, req)
+    t_cfp = time.time()
+    response_refs = [a.receive_cfp.remote(cfp) for a in resource_agents]
+    responses = ray.get(response_refs)
+    t_responses = time.time()
+    a2a_overhead_ms = (t_responses - t_cfp) * 1000
+
+    # ── fase scoring + accept (placement decision) ──
+    t_placement_start = time.time()
+    proposals = []
+    for resp in responses:
+        if resp and resp.msg_type in (MessageType.PROPOSE, MessageType.COUNTER_OFFER):
+            resp.offer.score = score_offer(resp.offer, policy)
+            proposals.append(resp)
+
+    status = "failed"
+    placed_on = None
+    estimated_latency_ms = None
+    sla_ok = False
+
+    if proposals:
+        best = max(proposals, key=lambda r: r.offer.score)
+        winner_idx = next(
+            i for i, a in enumerate(resource_agents)
+            if ray.get(a.get_state.remote())["node_id"] == best.sender_id
+        )
+        from protocol import make_accept, make_reject
+        accept_msg = make_accept(f"task-{task_id}", best.sender_id,
+                                 task_id, cfp.conversation_id)
+        ray.get(resource_agents[winner_idx].receive_accept.remote(accept_msg))
+
+        # Reject agli altri
+        for resp in proposals:
+            if resp.sender_id != best.sender_id:
+                loser_idx = next(
+                    i for i, a in enumerate(resource_agents)
+                    if ray.get(a.get_state.remote())["node_id"] == resp.sender_id
+                )
+                resource_agents[loser_idx].receive_reject.remote(
+                    make_reject(f"task-{task_id}", resp.sender_id,
+                                task_id, cfp.conversation_id, "better_offer")
+                )
+
+        status = "placed"
+        placed_on = best.sender_id
+        estimated_latency_ms = best.offer.estimated_latency_ms
+        sla_ok = estimated_latency_ms <= max_lat
+
+    t_placement_end = time.time()
+    placement_latency_ms = (t_placement_end - t_placement_start) * 1000 + a2a_overhead_ms
+
+    return {
+        "task_id":              task_id,
+        "status":               status,
+        "placed_on":            placed_on,
+        "placement_latency_ms": placement_latency_ms,
+        "a2a_overhead_ms":      a2a_overhead_ms,
+        "estimated_latency_ms": estimated_latency_ms,
+        "max_latency_ms":       max_lat,
+        "sla_ok":               sla_ok,
+        "proposals_received":   len(proposals),
+    }
+
+
+def gossip_round(agents: list) -> float:
+    """
+    Esegue un round di gossip CRDT e ritorna il tempo (ms).
+    """
+    t0 = time.time()
+    catalogues = [ray.get(a.get_catalogue_object.remote()) for a in agents]
+    for i, agent in enumerate(agents):
+        for j, cat in enumerate(catalogues):
+            if i != j:
+                agent.sync_catalogue.remote(cat)
+    time.sleep(0.05)
+    return (time.time() - t0) * 1000
+
+
+def measure_convergence_time(agents: list) -> float:
+    """
+    Misura il tempo necessario perché tutti i nodi convergano
+    eseguendo gossip round successivi fino a convergenza completa.
+    Ritorna il tempo totale in ms.
+    """
+    t0 = time.time()
+    for _ in range(5):           # max 5 round di gossip
+        gossip_round(agents)
+        catalogues = [ray.get(a.get_catalogue_object.remote()) for a in agents]
+        # Verifica se tutti i cataloghi sono allineati
+        converged = True
+        for i in range(len(catalogues)):
+            for j in range(i + 1, len(catalogues)):
+                if catalogues[i].convergence_diff(catalogues[j]):
+                    converged = False
+                    break
+            if not converged:
+                break
+        if converged:
+            break
+    return (time.time() - t0) * 1000
+
+
+def compute_metrics(task_results: list) -> dict:
+    """Calcola le 4 metriche aggregate da una lista di risultati task."""
+    placed = [r for r in task_results if r["status"] == "placed"]
+    if not placed:
+        return {"placement_latency_ms": 0, "a2a_overhead_ms": 0,
+                "sla_violation_rate": 1.0, "n_placed": 0, "n_total": len(task_results)}
+
+    sla_violations = sum(1 for r in placed if not r["sla_ok"])
+
+    return {
+        "placement_latency_ms": np.mean([r["placement_latency_ms"] for r in placed]),
+        "placement_latency_std": np.std([r["placement_latency_ms"] for r in placed]),
+        "a2a_overhead_ms":      np.mean([r["a2a_overhead_ms"] for r in placed]),
+        "a2a_overhead_std":     np.std([r["a2a_overhead_ms"] for r in placed]),
+        "sla_violation_rate":   sla_violations / len(placed),
+        "n_placed":             len(placed),
+        "n_total":              len(task_results),
+    }
+
+
+# ─────────────────────────────────────────────
+# Scenario 1 — Baseline
+# ─────────────────────────────────────────────
+
+def scenario_baseline() -> dict:
+    """
+    Carico normale: 10 task con requisiti misti, rete stabile.
+    Serve come riferimento per confrontare gli altri scenari.
+    """
+    print("\n[S1] Baseline — carico normale, rete stabile")
+    agents = make_resource_agents()
+
+    tasks = [
+        ("t01", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
+        ("t02", 2.0,  512, 100.0, PlacementPolicy.ENERGY_FIRST),
+        ("t03", 0.5,  128, 200.0, PlacementPolicy.BALANCED),
+        ("t04", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
+        ("t05", 1.0,  256, 500.0, PlacementPolicy.ENERGY_FIRST),
+        ("t06", 2.0,  512,  60.0, PlacementPolicy.BALANCED),
+        ("t07", 1.0,  256, 150.0, PlacementPolicy.BALANCED),
+        ("t08", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
+        ("t09", 2.0,  512, 200.0, PlacementPolicy.ENERGY_FIRST),
+        ("t10", 1.0,  256, 100.0, PlacementPolicy.BALANCED),
+    ]
+
+    results = []
+    for (tid, cpu, mem, lat, pol) in tasks:
+        r = run_task(tid, cpu, mem, lat, pol, agents)
+        results.append(r)
+        print(f"  {tid}: {r['status']} on {r['placed_on']} | "
+              f"lat={r['placement_latency_ms']:.1f}ms | SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
+
+    t_conv = measure_convergence_time(agents)
+    print(f"  CRDT convergence: {t_conv:.1f}ms")
+
+    metrics = compute_metrics(results)
+    metrics["crdt_convergence_ms"] = t_conv
+    metrics["task_results"] = results
+    return metrics
+
+
+# ─────────────────────────────────────────────
+# Scenario 2 — High Load
+# ─────────────────────────────────────────────
+
+def scenario_high_load() -> dict:
+    """
+    Burst di 20 task: i nodi si saturano progressivamente.
+    Aumentano i REJECT e le SLA violations.
+    """
+    print("\n[S2] High Load — 20 task in burst, nodi saturi")
+    agents = make_resource_agents()
+
+    # 20 task con requisiti variabili — alcuni "pesanti" che saturano i nodi
+    tasks = []
+    for i in range(20):
+        cpu  = random.choice([0.5, 1.0, 2.0, 4.0])
+        mem  = cpu * 256
+        lat  = random.choice([20.0, 50.0, 100.0, 200.0])
+        pol  = random.choice(list(PlacementPolicy))
+        tasks.append((f"hl{i:02d}", cpu, mem, lat, pol))
+
+    results = []
+    for (tid, cpu, mem, lat, pol) in tasks:
+        r = run_task(tid, cpu, mem, lat, pol, agents)
+        results.append(r)
+        print(f"  {tid}: {r['status']:6s} | proposals={r['proposals_received']} | "
+              f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
+
+    t_conv = measure_convergence_time(agents)
+    print(f"  CRDT convergence: {t_conv:.1f}ms")
+
+    metrics = compute_metrics(results)
+    metrics["crdt_convergence_ms"] = t_conv
+    metrics["task_results"] = results
+    return metrics
+
+
+# ─────────────────────────────────────────────
+# Scenario 3 — Node Failure
+# ─────────────────────────────────────────────
+
+def scenario_node_failure() -> dict:
+    """
+    Il nodo con più risorse (edge-node-4) va offline a metà esperimento.
+    I task successivi non lo vedono più tra i candidati.
+    Il CRDT registra il nodo come offline e propaga l'informazione.
+    """
+    print("\n[S3] Node Failure — edge-node-4 va offline a metà")
+    agents = make_resource_agents()
+
+    # Prima metà: tutti i nodi disponibili
+    tasks_pre = [
+        ("f01", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
+        ("f02", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
+        ("f03", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
+        ("f04", 1.0,  256, 200.0, PlacementPolicy.ENERGY_FIRST),
+        ("f05", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
+    ]
+
+    results = []
+    print("  [PRE-FAILURE] Tutti i nodi attivi:")
+    for (tid, cpu, mem, lat, pol) in tasks_pre:
+        r = run_task(tid, cpu, mem, lat, pol, agents)
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r['placed_on']} | "
+              f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
+
+    # Simula il failure: mark offline nel CRDT e rimuovi dall'insieme attivo
+    print("\n  >>> edge-node-4 va OFFLINE <<<")
+    t_failure = time.time()
+    # Il nodo 4 (indice 3) marca se stesso offline nel catalogo
+    agents[3].mark_offline_self.remote()
+    active_agents = agents[:3]   # solo i primi 3 nodi
+
+    # Propaga il failure via gossip
+    gossip_round(agents)
+
+    # Seconda metà: solo 3 nodi
+    tasks_post = [
+        ("f06", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
+        ("f07", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
+        ("f08", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
+        ("f09", 1.0,  256, 200.0, PlacementPolicy.ENERGY_FIRST),
+        ("f10", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
+    ]
+
+    print("  [POST-FAILURE] Solo 3 nodi attivi:")
+    for (tid, cpu, mem, lat, pol) in tasks_post:
+        r = run_task(tid, cpu, mem, lat, pol, active_agents)
+        r["post_failure"] = True
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r['placed_on']} | "
+              f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
+
+    t_conv = measure_convergence_time(agents)
+    print(f"  CRDT convergence dopo failure: {t_conv:.1f}ms")
+
+    metrics = compute_metrics(results)
+    metrics["crdt_convergence_ms"] = t_conv
+    metrics["failure_detected_ms"] = (time.time() - t_failure) * 1000
+    metrics["task_results"] = results
+    return metrics
+
+
+# ─────────────────────────────────────────────
+# Scenario 4 — Network Partition
+# ─────────────────────────────────────────────
+
+def scenario_network_partition() -> dict:
+    """
+    Il cluster viene diviso in 2 isole (partizione):
+      Isola A: edge-node-1, edge-node-2
+      Isola B: edge-node-3, edge-node-4
+
+    Durante la partizione ogni isola sincronizza solo internamente.
+    I due cataloghi CRDT divergono. Dopo la riconnessione, si misura
+    il tempo di convergenza (CRDT convergence time).
+    """
+    print("\n[S4] Network Partition — cluster diviso in 2 isole")
+    agents = make_resource_agents()
+
+    island_a = agents[:2]   # edge-node-1, edge-node-2
+    island_b = agents[2:]   # edge-node-3, edge-node-4
+
+    # ── Fase partizione: task su isole separate ──────────────
+    tasks_a = [
+        ("pa01", 1.0, 256,  50.0, PlacementPolicy.LATENCY_FIRST),
+        ("pa02", 2.0, 512, 100.0, PlacementPolicy.BALANCED),
+        ("pa03", 1.0, 256, 200.0, PlacementPolicy.ENERGY_FIRST),
+    ]
+    tasks_b = [
+        ("pb01", 1.0, 256,  80.0, PlacementPolicy.LATENCY_FIRST),
+        ("pb02", 2.0, 512, 150.0, PlacementPolicy.BALANCED),
+        ("pb03", 0.5, 128, 500.0, PlacementPolicy.ENERGY_FIRST),
+    ]
+
+    print("  [PARTIZIONE ATTIVA]")
+    print("  Isola A (node-1, node-2):")
+    results = []
+    for (tid, cpu, mem, lat, pol) in tasks_a:
+        # Sync solo dentro isola A
+        gossip_round(island_a)
+        r = run_task(tid, cpu, mem, lat, pol, island_a)
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
+
+    print("  Isola B (node-3, node-4):")
+    for (tid, cpu, mem, lat, pol) in tasks_b:
+        # Sync solo dentro isola B
+        gossip_round(island_b)
+        r = run_task(tid, cpu, mem, lat, pol, island_b)
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
+
+    # ── Verifica divergenza CRDT durante la partizione ────────
+    cat_a = ray.get(island_a[0].get_catalogue_object.remote())
+    cat_b = ray.get(island_b[0].get_catalogue_object.remote())
+    diffs_before = len(cat_a.convergence_diff(cat_b))
+    print(f"\n  Divergenza CRDT durante partizione: {diffs_before} entry divergenti")
+
+    # ── Riconnessione: gossip globale ─────────────────────────
+    print("  >>> Partizione risolta — gossip globale <<<")
+    t_reconnect = time.time()
+    t_conv = measure_convergence_time(agents)
+    print(f"  CRDT convergence time: {t_conv:.1f}ms")
+
+    # Verifica convergenza
+    cat_a_post = ray.get(island_a[0].get_catalogue_object.remote())
+    cat_b_post = ray.get(island_b[0].get_catalogue_object.remote())
+    diffs_after = len(cat_a_post.convergence_diff(cat_b_post))
+    print(f"  Divergenza CRDT dopo gossip: {diffs_after} entry divergenti "
+          f"({'CONVERGED' if diffs_after == 0 else 'STILL DIVERGING'})")
+
+    # ── Task post-riconnessione (cluster completo) ─────────────
+    print("  [POST-RICONNESSIONE] Cluster completo:")
+    tasks_post = [
+        ("pc01", 1.0, 256,  50.0, PlacementPolicy.LATENCY_FIRST),
+        ("pc02", 2.0, 512, 100.0, PlacementPolicy.BALANCED),
+    ]
+    for (tid, cpu, mem, lat, pol) in tasks_post:
+        r = run_task(tid, cpu, mem, lat, pol, agents)
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
+
+    metrics = compute_metrics(results)
+    metrics["crdt_convergence_ms"] = t_conv
+    metrics["diffs_during_partition"] = diffs_before
+    metrics["diffs_after_reconnect"] = diffs_after
+    metrics["task_results"] = results
+    return metrics
+
+
+# ─────────────────────────────────────────────
+# Grafici
+# ─────────────────────────────────────────────
+
+def plot_placement_latency(all_metrics: dict):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    scenarios = list(all_metrics.keys())
+    means = [all_metrics[s]["placement_latency_ms"] for s in scenarios]
+    stds  = [all_metrics[s].get("placement_latency_std", 0) for s in scenarios]
+    colors = [SCENARIO_COLORS[s] for s in scenarios]
+
+    bars = ax.bar(scenarios, means, color=colors, width=0.5,
+                  edgecolor="white", linewidth=1.2, zorder=3)
+    ax.errorbar(scenarios, means, yerr=stds, fmt="none",
+                color="black", capsize=5, linewidth=1.5, zorder=4)
+
+    for bar, val in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                f"{val:.1f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax.set_ylabel("Placement Latency (ms)", fontsize=12)
+    ax.set_title("Placement Latency per Scenario", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, max(means) * 1.3)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_placement_latency.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+def plot_a2a_overhead(all_metrics: dict):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    scenarios = list(all_metrics.keys())
+    means = [all_metrics[s]["a2a_overhead_ms"] for s in scenarios]
+    stds  = [all_metrics[s].get("a2a_overhead_std", 0) for s in scenarios]
+    colors = [SCENARIO_COLORS[s] for s in scenarios]
+
+    bars = ax.bar(scenarios, means, color=colors, width=0.5,
+                  edgecolor="white", linewidth=1.2, zorder=3)
+    ax.errorbar(scenarios, means, yerr=stds, fmt="none",
+                color="black", capsize=5, linewidth=1.5, zorder=4)
+
+    for bar, val in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                f"{val:.1f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax.set_ylabel("A2A Overhead (ms)", fontsize=12)
+    ax.set_title("A2A Protocol Overhead per Scenario", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, max(means) * 1.3)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_a2a_overhead.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+def plot_sla_violations(all_metrics: dict):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    scenarios = list(all_metrics.keys())
+    rates = [all_metrics[s]["sla_violation_rate"] * 100 for s in scenarios]
+    colors = [SCENARIO_COLORS[s] for s in scenarios]
+
+    bars = ax.bar(scenarios, rates, color=colors, width=0.5,
+                  edgecolor="white", linewidth=1.2, zorder=3)
+
+    for bar, val in zip(bars, rates):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+                f"{val:.1f}%", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    # Linea soglia 10%
+    ax.axhline(y=10, color="red", linestyle="--", linewidth=1.5,
+               label="Soglia SLA (10%)", zorder=4)
+    ax.legend(fontsize=10)
+
+    ax.set_ylabel("SLA Violation Rate (%)", fontsize=12)
+    ax.set_title("SLA Violation Rate per Scenario", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, max(max(rates) * 1.3, 15))
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_sla_violations.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+def plot_crdt_convergence(all_metrics: dict):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    scenarios = list(all_metrics.keys())
+    times = [all_metrics[s]["crdt_convergence_ms"] for s in scenarios]
+    colors = [SCENARIO_COLORS[s] for s in scenarios]
+
+    bars = ax.bar(scenarios, times, color=colors, width=0.5,
+                  edgecolor="white", linewidth=1.2, zorder=3)
+
+    for bar, val in zip(bars, times):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                f"{val:.0f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax.set_ylabel("Convergence Time (ms)", fontsize=12)
+    ax.set_title("CRDT Convergence Time per Scenario", fontsize=14, fontweight="bold")
+    ax.set_ylim(0, max(times) * 1.3)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_crdt_convergence.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+def plot_summary_dashboard(all_metrics: dict):
+    """
+    Dashboard 2x2 con tutte e 4 le metriche in un'unica figura.
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle("Fase 4 — Riepilogo Metriche per Scenario",
+                 fontsize=16, fontweight="bold", y=1.01)
+
+    scenarios = list(all_metrics.keys())
+    colors    = [SCENARIO_COLORS[s] for s in scenarios]
+    x         = np.arange(len(scenarios))
+    bar_w     = 0.5
+
+    # ── (0,0) Placement Latency ──────────────────────────────
+    ax = axes[0][0]
+    vals = [all_metrics[s]["placement_latency_ms"] for s in scenarios]
+    stds = [all_metrics[s].get("placement_latency_std", 0) for s in scenarios]
+    ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.errorbar(x, vals, yerr=stds, fmt="none", color="black", capsize=4, zorder=4)
+    ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
+    ax.set_title("Placement Latency (ms)", fontweight="bold")
+    ax.set_ylim(0, max(vals) * 1.35)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    for xi, v in zip(x, vals):
+        ax.text(xi, v + max(vals)*0.02, f"{v:.1f}", ha="center", fontsize=8)
+
+    # ── (0,1) A2A Overhead ───────────────────────────────────
+    ax = axes[0][1]
+    vals = [all_metrics[s]["a2a_overhead_ms"] for s in scenarios]
+    stds = [all_metrics[s].get("a2a_overhead_std", 0) for s in scenarios]
+    ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.errorbar(x, vals, yerr=stds, fmt="none", color="black", capsize=4, zorder=4)
+    ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
+    ax.set_title("A2A Protocol Overhead (ms)", fontweight="bold")
+    ax.set_ylim(0, max(vals) * 1.35)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    for xi, v in zip(x, vals):
+        ax.text(xi, v + max(vals)*0.02, f"{v:.1f}", ha="center", fontsize=8)
+
+    # ── (1,0) SLA Violation Rate ─────────────────────────────
+    ax = axes[1][0]
+    vals = [all_metrics[s]["sla_violation_rate"] * 100 for s in scenarios]
+    ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.axhline(y=10, color="red", linestyle="--", linewidth=1.3,
+               label="Soglia 10%", zorder=4)
+    ax.legend(fontsize=8)
+    ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
+    ax.set_title("SLA Violation Rate (%)", fontweight="bold")
+    ax.set_ylim(0, max(max(vals) * 1.35, 15))
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    for xi, v in zip(x, vals):
+        ax.text(xi, v + 0.5, f"{v:.1f}%", ha="center", fontsize=8)
+
+    # ── (1,1) CRDT Convergence ───────────────────────────────
+    ax = axes[1][1]
+    vals = [all_metrics[s]["crdt_convergence_ms"] for s in scenarios]
+    ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
+    ax.set_title("CRDT Convergence Time (ms)", fontweight="bold")
+    ax.set_ylim(0, max(vals) * 1.35)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    for xi, v in zip(x, vals):
+        ax.text(xi, v + max(vals)*0.02, f"{v:.0f}", ha="center", fontsize=8)
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "summary_dashboard.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+def plot_partition_crdt_divergence(s4_metrics: dict):
+    """
+    Grafico specifico per S4: mostra la divergenza CRDT
+    prima e dopo la riconnessione.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4))
+    labels = ["Durante la partizione", "Dopo il gossip"]
+    vals   = [
+        s4_metrics.get("diffs_during_partition", 0),
+        s4_metrics.get("diffs_after_reconnect", 0),
+    ]
+    colors = ["#E84855", "#43AA8B"]
+    bars = ax.bar(labels, vals, color=colors, width=0.4,
+                  edgecolor="white", linewidth=1.2, zorder=3)
+    for bar, v in zip(bars, vals):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                str(v), ha="center", va="bottom", fontsize=12, fontweight="bold")
+
+    ax.set_ylabel("Entry divergenti nel catalogo CRDT", fontsize=11)
+    ax.set_title("S4 — Divergenza CRDT: Partizione vs. Riconnessione",
+                 fontsize=13, fontweight="bold")
+    ax.set_ylim(0, max(vals) * 1.5 + 1)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_partition_divergence.png")
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
+
+def sep(c="═", w=65): print(c * w)
+
+def main():
+    sep(); print("  FASE 4 — Experimentation & Evaluation"); sep()
+    ray.init(ignore_reinit_error=True)
+
+    # ── Aggiunge metodo mark_offline_self agli agenti ────────────
+    # (necessario per S3 — viene chiamato sull'agente da remoto)
+
+    all_metrics: Dict[str, Any] = {}
+
+    # ── Esecuzione scenari ───────────────────────────────────────
+    sep("─")
+    print("SCENARIO 1 — Baseline"); sep("─")
+    all_metrics["S1 Baseline"] = scenario_baseline()
+
+    sep("─")
+    print("SCENARIO 2 — High Load"); sep("─")
+    all_metrics["S2 High Load"] = scenario_high_load()
+
+    sep("─")
+    print("SCENARIO 3 — Node Failure"); sep("─")
+    all_metrics["S3 Node Failure"] = scenario_node_failure()
+
+    sep("─")
+    print("SCENARIO 4 — Network Partition"); sep("─")
+    all_metrics["S4 Net Partition"] = scenario_network_partition()
+
+    # ── Riepilogo testuale ───────────────────────────────────────
+    sep()
+    print("  RIEPILOGO METRICHE")
+    sep()
+    print(f"{'Scenario':<22} {'PlacLat(ms)':<14} {'A2A(ms)':<12} "
+          f"{'SLA viol%':<12} {'CRDT conv(ms)'}")
+    sep("─")
+    for s, m in all_metrics.items():
+        print(f"{s:<22} "
+              f"{m['placement_latency_ms']:<14.1f} "
+              f"{m['a2a_overhead_ms']:<12.1f} "
+              f"{m['sla_violation_rate']*100:<12.1f} "
+              f"{m['crdt_convergence_ms']:.1f}")
+
+    # ── Salva dati grezzi ────────────────────────────────────────
+    raw_path = os.path.join(RESULTS_DIR, "raw_results.json")
+    # Converti numpy types per JSON serialization
+    def to_serializable(obj):
+        if isinstance(obj, (np.float64, np.float32)):
+            return float(obj)
+        if isinstance(obj, (np.int64, np.int32)):
+            return int(obj)
+        if isinstance(obj, dict):
+            return {k: to_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [to_serializable(i) for i in obj]
+        return obj
+
+    with open(raw_path, "w") as f:
+        json.dump(to_serializable(all_metrics), f, indent=2)
+    print(f"\n  Dati grezzi salvati: {raw_path}")
+
+    # ── Genera grafici ───────────────────────────────────────────
+    sep()
+    print("  GENERAZIONE GRAFICI")
+    sep("─")
+    plot_placement_latency(all_metrics)
+    plot_a2a_overhead(all_metrics)
+    plot_sla_violations(all_metrics)
+    plot_crdt_convergence(all_metrics)
+    plot_summary_dashboard(all_metrics)
+    plot_partition_crdt_divergence(all_metrics["S4 Net Partition"])
+
+    sep()
+    print("  FASE 4 COMPLETATA")
+    print(f"  Grafici in: {RESULTS_DIR}/")
+    sep()
+
+    ray.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,98 @@
+{
+  "timestamp": 1776351458.0087936,
+  "placements": [
+    {
+      "task_id": "task-01",
+      "status": "placed",
+      "placed_on": "edge-node-1",
+      "policy": "latency_first",
+      "score": 0.9399306303587706,
+      "estimated_latency_ms": 21.478121172306732,
+      "energy_score": 0.3,
+      "placement_latency_ms": 12.393474578857422,
+      "proposals_received": 3,
+      "rejections_received": 1
+    },
+    {
+      "task_id": "task-02",
+      "status": "placed",
+      "placed_on": "edge-node-1",
+      "policy": "energy_first",
+      "score": 0.7366884513620371,
+      "estimated_latency_ms": 16.557743189814474,
+      "energy_score": 0.3,
+      "placement_latency_ms": 19.37389373779297,
+      "proposals_received": 4,
+      "rejections_received": 0
+    },
+    {
+      "task_id": "task-03",
+      "status": "placed",
+      "placed_on": "edge-node-1",
+      "policy": "balanced",
+      "score": 0.7498569754316844,
+      "estimated_latency_ms": 12.678780710394513,
+      "energy_score": 0.3,
+      "placement_latency_ms": 13.408660888671875,
+      "proposals_received": 4,
+      "rejections_received": 0
+    },
+    {
+      "task_id": "task-04",
+      "status": "failed",
+      "reason": "no_proposals",
+      "placement_latency_ms": 5.220651626586914,
+      "proposals_received": 0
+    },
+    {
+      "task_id": "task-05",
+      "status": "placed",
+      "placed_on": "edge-node-3",
+      "policy": "energy_first",
+      "score": 0.6933944807644212,
+      "estimated_latency_ms": 83.02759617789366,
+      "energy_score": 0.2,
+      "placement_latency_ms": 13.350486755371094,
+      "proposals_received": 4,
+      "rejections_received": 0
+    },
+    {
+      "task_id": "task-06",
+      "status": "placed",
+      "placed_on": "edge-node-4",
+      "policy": "balanced",
+      "score": 0.7417087288434525,
+      "estimated_latency_ms": 22.8640889456843,
+      "energy_score": 0.8,
+      "placement_latency_ms": 12.721776962280273,
+      "proposals_received": 3,
+      "rejections_received": 1
+    },
+    {
+      "task_id": "task-07",
+      "status": "placed",
+      "placed_on": "edge-node-4",
+      "policy": "balanced",
+      "score": 0.7414482436498674,
+      "estimated_latency_ms": 23.18969543766572,
+      "energy_score": 0.8,
+      "placement_latency_ms": 9.607553482055664,
+      "proposals_received": 1,
+      "rejections_received": 3
+    },
+    {
+      "task_id": "task-08",
+      "status": "placed",
+      "placed_on": "edge-node-1",
+      "policy": "latency_first",
+      "score": 0.7956327951283584,
+      "estimated_latency_ms": 17.405146336886855,
+      "energy_score": 0.3,
+      "placement_latency_ms": 6.699800491333008,
+      "proposals_received": 1,
+      "rejections_received": 3
+    }
+  ],
+  "crdt_convergence_pct": 100.0,
+  "gossip_duration_ms": 110.28122901916504
+}
