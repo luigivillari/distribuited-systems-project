@@ -1,7 +1,7 @@
 """
 agents.py
 =========
-Fase 2 — Agent Modelling: ResourceAgent e TaskAgent come Ray Actors
+Fase 2 — Agent Modelling: ResourceAgent, TaskAgent e NashTaskAgent come Ray Actors
 """
 
 import ray
