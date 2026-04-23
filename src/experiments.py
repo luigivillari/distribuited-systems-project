@@ -40,14 +40,14 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 from protocol import TaskRequirements, PlacementPolicy, MessageType, make_cfp, score_offer
-from agents import ResourceAgent, TaskAgent
+from agents import ResourceAgent, TaskAgent, NashTaskAgent
 from crdt_catalogue import ResourceCatalogue
 
 # ─────────────────────────────────────────────
 # Configurazione globale
 # ─────────────────────────────────────────────
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_nash")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 EDGE_NODES = [
@@ -63,6 +63,7 @@ SCENARIO_COLORS = {
     "S2 High Load":       "#E84855",
     "S3 Node Failure":    "#F9A825",
     "S4 Net Partition":   "#43AA8B",
+    "S5 Nash Equil.":     "#9B59B6",
 }
 
 SCENARIOS = list(SCENARIO_COLORS.keys())
@@ -453,8 +454,128 @@ def scenario_network_partition() -> dict:
 
 
 # ─────────────────────────────────────────────
-# Grafici
+# Scenario 5 — Nash Equilibrium (Greedy vs IBR)
 # ─────────────────────────────────────────────
+
+def scenario_s5_nash() -> dict:
+    """
+    Confronto diretto tra TaskAgent greedy (singolo round) e NashTaskAgent
+    (Iterative Best Response) su task con requisiti di latenza inizialmente
+    molto stringenti.
+
+    Il TaskAgent greedy fallisce o viola SLA quando i nodi non riescono a
+    soddisfare i requisiti. Il NashTaskAgent negozia in piu' round rilassando
+    progressivamente i vincoli finche' tutte le 4 condizioni di Nash Equilibrium
+    sono soddisfatte, garantendo un'allocazione stabile.
+
+    Metriche aggiuntive rispetto agli altri scenari:
+      - nash_rounds_to_convergence : quanti round ha impiegato ogni task
+      - nash_winner_utility         : utilita' del nodo vincitore in [0,1]
+      - confronto greedy vs nash    : success rate e SLA violation rate
+    """
+    print("\n[S5] Nash Equilibrium — Greedy vs. Iterative Best Response")
+
+    # Task con latenze MOLTO stringenti: forzano piu' round di negoziazione.
+    # Le latenze base dei nodi sono: node-1=15ms, node-2=40ms,
+    # node-3=80ms, node-4=25ms  (piu' jitter fino a +15ms)
+    # Quindi requisiti < 20ms rendono difficile trovare NE al primo round.
+    tasks = [
+        # (id,   cpu,  mem,  max_lat, policy)
+        ("n01", 1.0,  256,  12.0, PlacementPolicy.LATENCY_FIRST),  # quasi impossibile
+        ("n02", 2.0,  512,  18.0, PlacementPolicy.BALANCED),       # molto stretta
+        ("n03", 0.5,  128,  10.0, PlacementPolicy.LATENCY_FIRST),  # impossibile greedy
+        ("n04", 4.0, 1024,  20.0, PlacementPolicy.LATENCY_FIRST),  # stretta + pesante
+        ("n05", 1.0,  256,  15.0, PlacementPolicy.ENERGY_FIRST),   # stretta
+        ("n06", 2.0,  512,  25.0, PlacementPolicy.BALANCED),       # al limite
+        ("n07", 0.5,  128,   8.0, PlacementPolicy.LATENCY_FIRST),  # impossibile greedy
+        ("n08", 3.0,  768,  22.0, PlacementPolicy.BALANCED),       # stretta + media
+    ]
+
+    # ── Run GREEDY (TaskAgent standard — singolo round) ──────────────────────
+    print("\n  [GREEDY — singolo round, nessuna negoziazione]")
+    greedy_agents  = make_resource_agents()
+    greedy_results = []
+    for (tid, cpu, mem, lat, pol) in tasks:
+        r = run_task(tid, cpu, mem, lat, pol, greedy_agents)
+        greedy_results.append(r)
+        lat_str = f"{r['estimated_latency_ms']:.1f}ms" if r["estimated_latency_ms"] else "N/A"
+        print(f"    {tid}: {r['status']:6s} | proposals={r['proposals_received']} | "
+              f"lat={lat_str} | SLA={'OK' if r['sla_ok'] else 'FAIL'}")
+
+    # ── Run NASH (NashTaskAgent — Iterative Best Response) ───────────────────
+    print("\n  [NASH IBR — multi-round, rilassamento progressivo]")
+    nash_agents  = make_resource_agents()
+    nash_results = []
+    for (tid, cpu, mem, lat, pol) in tasks:
+        req   = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
+                                 max_latency_ms=lat, duration_sec=10,
+                                 priority=2, task_type="generic")
+        nagent = NashTaskAgent.remote(tid, req, pol,
+                                      max_rounds=5, relaxation_factor=0.20)
+        r = ray.get(nagent.place_nash.remote(nash_agents))
+        nash_results.append(r)
+        converged = r.get("nash_converged", False)
+        rounds    = r.get("nash_rounds", "?")
+        lat_str   = (f"{r['estimated_latency_ms']:.1f}ms"
+                     if r.get("estimated_latency_ms") else "N/A")
+        print(f"    {tid}: {r.get('status','?'):6s} | rounds={rounds} | "
+              f"Nash={'OK' if converged else 'fallback'} | lat={lat_str}")
+
+    # ── Metriche comparative ──────────────────────────────────────────────────
+    greedy_placed = [r for r in greedy_results if r["status"] == "placed"]
+    nash_placed   = [r for r in nash_results   if r.get("status") == "placed"]
+
+    greedy_sla_viol = sum(1 for r in greedy_placed if not r["sla_ok"])
+    nash_sla_viol   = sum(1 for r in nash_placed
+                          if not r.get("sla_ok_original", True))
+
+    rounds_list  = [r.get("nash_rounds", 0) for r in nash_results
+                    if r.get("status") == "placed"]
+    mean_rounds  = float(np.mean(rounds_list))  if rounds_list  else 0.0
+    utilities    = [r.get("nash_winner_utility", 0) for r in nash_placed]
+    mean_utility = float(np.mean(utilities)) if utilities else 0.0
+
+    t_conv = measure_convergence_time(nash_agents)
+
+    # Metriche compatibili con il summary table
+    nash_latencies = [r.get("placement_latency_ms", 0)
+                      for r in nash_results if r.get("status") == "placed"]
+
+    print(f"\n  Greedy: {len(greedy_placed)}/{len(tasks)} piazzati, "
+          f"{greedy_sla_viol} SLA violations")
+    print(f"  Nash  : {len(nash_placed)}/{len(tasks)} piazzati, "
+          f"{nash_sla_viol} SLA violations (su req. originali), "
+          f"rounds medi={mean_rounds:.1f}, utility={mean_utility:.3f}")
+    print(f"  CRDT convergence: {t_conv:.1f}ms")
+
+    return {
+        # Metriche Nash per summary table
+        "placement_latency_ms":  float(np.mean(nash_latencies)) if nash_latencies else 0.0,
+        "placement_latency_std": float(np.std(nash_latencies))  if nash_latencies else 0.0,
+        "a2a_overhead_ms":       0.0,   # inglobato nei round multipli
+        "a2a_overhead_std":      0.0,
+        "sla_violation_rate":    nash_sla_viol / max(len(nash_placed), 1),
+        "n_placed":              len(nash_placed),
+        "n_total":               len(tasks),
+        "crdt_convergence_ms":   t_conv,
+        # Metriche specifiche S5
+        "greedy_n_placed":       len(greedy_placed),
+        "greedy_n_failed":       len(tasks) - len(greedy_placed),
+        "greedy_sla_violations": greedy_sla_viol,
+        "greedy_success_rate":   len(greedy_placed) / len(tasks),
+        "nash_n_placed":         len(nash_placed),
+        "nash_n_failed":         len(tasks) - len(nash_placed),
+        "nash_sla_violations":   nash_sla_viol,
+        "nash_success_rate":     len(nash_placed) / len(tasks),
+        "nash_mean_rounds":      mean_rounds,
+        "nash_mean_utility":     mean_utility,
+        "task_results_greedy":   greedy_results,
+        "task_results_nash":     nash_results,
+        "task_labels":           [t[0] for t in tasks],
+    }
+
+
+
 
 def plot_placement_latency(all_metrics: dict):
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -669,6 +790,127 @@ def plot_partition_crdt_divergence(s4_metrics: dict):
     print(f"  Salvato: {path}")
 
 
+def plot_nash_convergence(s5_metrics: dict):
+    """
+    Due subplot:
+      (a) Rounds to Nash Equilibrium per task
+          Verde  = NE al round 1 (nessun rilassamento necessario)
+          Giallo = NE al round 2
+          Rosso  = NE al round 3+
+          Viola  = fallback (max_rounds esaurito, nessun NE formale)
+          Grigio = task fallito (0 proposte in tutti i round)
+      (b) Confronto Greedy vs Nash IBR su 3 indicatori:
+          task piazzati, fallimenti, violazioni SLA (requisiti originali)
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("S5 — Nash Equilibrium: Greedy vs. Iterative Best Response",
+                 fontsize=14, fontweight="bold")
+
+    nash_results = s5_metrics["task_results_nash"]
+    task_labels  = s5_metrics["task_labels"]
+
+    # ── (a) Rounds to Nash Equilibrium ───────────────────────────────────────
+    rounds       = []
+    colors_rounds = []
+    for r in nash_results:
+        rds    = r.get("nash_rounds", 0)
+        status = r.get("status", "failed")
+        if status != "placed":
+            rounds.append(0)
+            colors_rounds.append("#888888")          # grigio = fallito
+        elif r.get("nash_converged", False):
+            rounds.append(rds)
+            if rds == 1:
+                colors_rounds.append("#43AA8B")      # verde  = NE immediato
+            elif rds == 2:
+                colors_rounds.append("#F9A825")      # giallo = 2 round
+            else:
+                colors_rounds.append("#E84855")      # rosso  = 3+ round
+        else:
+            rounds.append(rds)
+            colors_rounds.append("#9B59B6")          # viola  = fallback
+
+    bars1 = ax1.bar(task_labels, rounds, color=colors_rounds,
+                    edgecolor="white", linewidth=1.2, zorder=3)
+    for bar, val, r in zip(bars1, rounds, nash_results):
+        label = str(val) if r.get("status") == "placed" else "X"
+        ax1.text(bar.get_x() + bar.get_width() / 2,
+                 bar.get_height() + 0.05, label,
+                 ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    legend_patches = [
+        mpatches.Patch(color="#43AA8B", label="NE @ round 1 (equilibrio immediato)"),
+        mpatches.Patch(color="#F9A825", label="NE @ round 2"),
+        mpatches.Patch(color="#E84855", label="NE @ round 3+"),
+        mpatches.Patch(color="#9B59B6", label="Fallback (max rounds esaurito)"),
+        mpatches.Patch(color="#888888", label="Fallito (0 proposte)"),
+    ]
+    ax1.legend(handles=legend_patches, fontsize=7.5, loc="upper right")
+    ax1.set_xlabel("Task", fontsize=11)
+    ax1.set_ylabel("Round di negoziazione", fontsize=11)
+    ax1.set_title("(a) Rounds to Nash Equilibrium per Task",
+                  fontsize=12, fontweight="bold")
+    ax1.set_ylim(0, max(rounds + [1]) * 1.5 + 1)
+    ax1.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    ax1.set_axisbelow(True)
+
+    # ── (b) Greedy vs Nash comparison ────────────────────────────────────────
+    n_tasks         = len(nash_results)
+    metrics_labels  = ["Task piazzati", "Fallimenti", "Violazioni SLA*"]
+    greedy_vals = [
+        s5_metrics["greedy_n_placed"],
+        s5_metrics["greedy_n_failed"],
+        s5_metrics["greedy_sla_violations"],
+    ]
+    nash_vals = [
+        s5_metrics["nash_n_placed"],
+        s5_metrics["nash_n_failed"],
+        s5_metrics["nash_sla_violations"],
+    ]
+
+    x     = np.arange(len(metrics_labels))
+    width = 0.35
+    bars_g = ax2.bar(x - width / 2, greedy_vals, width,
+                     label="Greedy (1 round)",
+                     color="#2E86AB", edgecolor="white", zorder=3)
+    bars_n = ax2.bar(x + width / 2, nash_vals,   width,
+                     label="Nash IBR (multi-round)",
+                     color="#43AA8B", edgecolor="white", zorder=3)
+
+    for bar in list(bars_g) + list(bars_n):
+        h = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width() / 2,
+                 h + 0.05, str(int(h)),
+                 ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(metrics_labels, fontsize=10)
+    ax2.set_ylabel("Numero di task", fontsize=11)
+    ax2.set_title(f"(b) Greedy vs Nash — {n_tasks} task con SLA stringenti",
+                  fontsize=12, fontweight="bold")
+    ax2.set_ylim(0, max(max(greedy_vals), max(nash_vals), 1) * 1.5 + 1)
+    ax2.legend(fontsize=9)
+    ax2.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    ax2.set_axisbelow(True)
+
+    # Annotazione riepilogativa
+    ax2.text(
+        0.98, 0.97,
+        f"Rounds medi Nash : {s5_metrics['nash_mean_rounds']:.1f}\n"
+        f"Utility media    : {s5_metrics['nash_mean_utility']:.3f}\n"
+        f"* SLA calcolate sui requisiti originali",
+        transform=ax2.transAxes, fontsize=8.5,
+        verticalalignment="top", horizontalalignment="right",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.85),
+    )
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_nash_convergence.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
@@ -700,6 +942,10 @@ def main():
     sep("─")
     print("SCENARIO 4 — Network Partition"); sep("─")
     all_metrics["S4 Net Partition"] = scenario_network_partition()
+
+    sep("─")
+    print("SCENARIO 5 — Nash Equilibrium (Greedy vs IBR)"); sep("─")
+    all_metrics["S5 Nash Equil."] = scenario_s5_nash()
 
     # ── Riepilogo testuale ───────────────────────────────────────
     sep()
@@ -743,6 +989,7 @@ def main():
     plot_crdt_convergence(all_metrics)
     plot_summary_dashboard(all_metrics)
     plot_partition_crdt_divergence(all_metrics["S4 Net Partition"])
+    plot_nash_convergence(all_metrics["S5 Nash Equil."])
 
     sep()
     print("  FASE 4 COMPLETATA")
