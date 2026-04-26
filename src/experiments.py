@@ -47,7 +47,7 @@ from crdt_catalogue import ResourceCatalogue
 # Configurazione globale
 # ─────────────────────────────────────────────
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_nash")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_nash_test")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 EDGE_NODES = [

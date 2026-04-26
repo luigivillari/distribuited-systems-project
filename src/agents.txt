@@ -1,0 +1,218 @@
+═════════════════════════════════════════════════════════════════
+  FASE 4 — Experimentation & Evaluation
+═════════════════════════════════════════════════════════════════
+─────────────────────────────────────────────────────────────────
+SCENARIO 1 — Baseline
+─────────────────────────────────────────────────────────────────
+
+[S1] Baseline — carico normale, rete stabile
+[36m(ResourceAgent pid=12305)[0m [edge-node-3] ResourceAgent avviato: CPU=2.0, MEM=1024MB, LAT=80.0ms, ENERGY=0.20
+  t01: placed on edge-node-1 | lat=35.2ms | SLA=OK
+  t02: placed on edge-node-1 | lat=31.2ms | SLA=OK
+  t03: placed on edge-node-1 | lat=34.0ms | SLA=OK
+[36m(ResourceAgent pid=12308)[0m [edge-node-1] ACCEPT ricevuto per task=t01. CPU rimasta: 6.0, MEM: 3584MB
+[36m(ResourceAgent pid=12308)[0m [edge-node-1] ACCEPT ricevuto per task=t02. CPU rimasta: 4.0, MEM: 3072MB
+[36m(ResourceAgent pid=12308)[0m [edge-node-1] ACCEPT ricevuto per task=t03. CPU rimasta: 2.0, MEM: 2560MB
+  t04: placed on edge-node-4 | lat=24.7ms | SLA=VIOLATION
+  t05: placed on edge-node-3 | lat=28.8ms | SLA=OK
+  t06: placed on edge-node-4 | lat=19.1ms | SLA=OK
+  t07: placed on edge-node-4 | lat=24.3ms | SLA=OK
+  t08: placed on edge-node-4 | lat=23.1ms | SLA=VIOLATION
+  t09: placed on edge-node-1 | lat=20.1ms | SLA=OK
+  t10: placed on edge-node-4 | lat=16.3ms | SLA=OK
+[36m(ResourceAgent pid=12305)[0m [edge-node-3] CRDT sync: clock 2 -> 6
+[36m(ResourceAgent pid=12305)[0m [edge-node-3] CRDT sync: clock 6 -> 7
+[36m(ResourceAgent pid=12305)[0m [edge-node-3] CRDT sync: clock 7 -> 8
+  CRDT convergence: 73.7ms
+─────────────────────────────────────────────────────────────────
+SCENARIO 2 — High Load
+─────────────────────────────────────────────────────────────────
+
+[S2] High Load — 20 task in burst, nodi saturi
+  hl00: placed | proposals=4 | SLA=OK
+  hl01: placed | proposals=4 | SLA=OK
+  hl02: placed | proposals=4 | SLA=OK
+  hl03: placed | proposals=4 | SLA=VIOLATION
+  hl04: placed | proposals=3 | SLA=OK
+  hl05: placed | proposals=3 | SLA=OK
+  hl06: placed | proposals=3 | SLA=VIOLATION
+  hl07: placed | proposals=2 | SLA=OK
+  hl08: placed | proposals=2 | SLA=OK
+  hl09: placed | proposals=2 | SLA=VIOLATION
+  hl10: placed | proposals=2 | SLA=VIOLATION
+  hl11: placed | proposals=2 | SLA=VIOLATION
+  hl12: placed | proposals=2 | SLA=OK
+  hl13: placed | proposals=1 | SLA=VIOLATION
+  hl14: failed | proposals=0 | SLA=VIOLATION
+  hl15: failed | proposals=0 | SLA=VIOLATION
+  hl16: placed | proposals=1 | SLA=OK
+  hl17: failed | proposals=0 | SLA=VIOLATION
+  hl18: failed | proposals=0 | SLA=VIOLATION
+  hl19: failed | proposals=0 | SLA=VIOLATION
+  CRDT convergence: 70.6ms
+─────────────────────────────────────────────────────────────────
+SCENARIO 3 — Node Failure
+─────────────────────────────────────────────────────────────────
+
+[S3] Node Failure — edge-node-4 va offline a metà
+  [PRE-FAILURE] Tutti i nodi attivi:
+    f01: placed on edge-node-1 | SLA=OK
+    f02: placed on edge-node-1 | SLA=OK
+    f03: placed on edge-node-4 | SLA=VIOLATION
+    f04: placed on edge-node-3 | SLA=OK
+    f05: placed on edge-node-4 | SLA=VIOLATION
+
+  >>> edge-node-4 va OFFLINE <<<
+[36m(ResourceAgent pid=12614)[0m [edge-node-4] Marcato OFFLINE nel catalogo CRDT
+  [POST-FAILURE] Solo 3 nodi attivi:
+    f06: placed on edge-node-1 | SLA=OK
+    f07: placed on edge-node-1 | SLA=OK
+    f08: placed on edge-node-2 | SLA=VIOLATION
+    f09: placed on edge-node-2 | SLA=OK
+    f10: failed on None | SLA=VIOLATION
+  CRDT convergence dopo failure: 71.6ms
+─────────────────────────────────────────────────────────────────
+SCENARIO 4 — Network Partition
+─────────────────────────────────────────────────────────────────
+
+[S4] Network Partition — cluster diviso in 2 isole
+  [PARTIZIONE ATTIVA]
+  Isola A (node-1, node-2):
+    pa01: placed on edge-node-1
+    pa02: placed on edge-node-1
+    pa03: placed on edge-node-1
+  Isola B (node-3, node-4):
+    pb01: placed on edge-node-4
+    pb02: placed on edge-node-4
+    pb03: placed on edge-node-3
+
+  Divergenza CRDT durante partizione: 4 entry divergenti
+  >>> Partizione risolta — gossip globale <<<
+  CRDT convergence time: 77.3ms
+  Divergenza CRDT dopo gossip: 0 entry divergenti (CONVERGED)
+  [POST-RICONNESSIONE] Cluster completo:
+    pc01: placed on edge-node-4
+    pc02: placed on edge-node-4
+─────────────────────────────────────────────────────────────────
+SCENARIO 5 — Nash Equilibrium (Greedy vs IBR)
+─────────────────────────────────────────────────────────────────
+
+[S5] Nash Equilibrium — Greedy vs. Iterative Best Response
+
+  [GREEDY — singolo round, nessuna negoziazione]
+    n01: placed | proposals=4 | lat=26.1ms | SLA=FAIL
+    n02: placed | proposals=4 | lat=15.5ms | SLA=OK
+    n03: placed | proposals=4 | lat=35.9ms | SLA=FAIL
+    n04: placed | proposals=3 | lat=35.6ms | SLA=FAIL
+    n05: placed | proposals=4 | lat=89.1ms | SLA=FAIL
+    n06: placed | proposals=3 | lat=10.7ms | SLA=OK
+    n07: placed | proposals=3 | lat=36.6ms | SLA=FAIL
+    n08: placed | proposals=2 | lat=34.7ms | SLA=FAIL
+
+  [NASH IBR — multi-round, rilassamento progressivo]
+[36m(ResourceAgent pid=13059)[0m [edge-node-4] ResourceAgent avviato: CPU=16.0, MEM=8192MB, LAT=25.0ms, ENERGY=0.80[32m [repeated 22x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+    n01: placed | rounds=3 | Nash=OK | lat=19.6ms
+[36m(ResourceAgent pid=13060)[0m [edge-node-1] ACCEPT ricevuto per task=n01. CPU rimasta: 6.0, MEM: 3584MB[32m [repeated 48x across cluster][0m
+[36m(NashTaskAgent pid=13065)[0m [NashAgent:n01] Creato. Policy=latency_first, max_rounds=5, relaxation=20%
+[36m(NashTaskAgent pid=13065)[0m 
+[36m(NashTaskAgent pid=13065)[0m [NashAgent:n01] Round 1/5 - CPU>=1.0, MEM>=256MB, LAT<=12.0ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-1: score=0.948, lat=15.4ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-2: score=0.783, lat=48.0ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-3: score=0.715, lat=82.2ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-4: score=0.882, lat=26.8ms
+[36m(NashTaskAgent pid=13065)[0m   Non in equilibrio (C3_sla_stability). Rilascio requisiti.
+[36m(NashTaskAgent pid=13065)[0m 
+[36m(NashTaskAgent pid=13065)[0m [NashAgent:n01] Round 2/5 - CPU>=0.94, MEM>=240.64MB, LAT<=14.4ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-1: score=0.930, lat=28.7ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-2: score=0.794, lat=40.3ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-3: score=0.715, lat=82.1ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-4: score=0.889, lat=22.4ms
+[36m(NashTaskAgent pid=13065)[0m   Non in equilibrio (C3_sla_stability). Rilascio requisiti.
+[36m(NashTaskAgent pid=13065)[0m 
+[36m(NashTaskAgent pid=13065)[0m [NashAgent:n01] Round 3/5 - CPU>=0.88, MEM>=226.2MB, LAT<=20.2ms
+[36m(NashTaskAgent pid=13065)[0m   <- PROPOSE         da edge-node-1: score=0.943, lat=19.6ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-2: score=0.796, lat=38.7ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-3: score=0.720, lat=78.7ms
+[36m(NashTaskAgent pid=13065)[0m   <- COUNTER_OFFER   da edge-node-4: score=0.883, lat=26.5ms
+[36m(NashTaskAgent pid=13065)[0m   Nash Equilibrium al round 3! Vincitore=edge-node-1, utility=0.676
+[36m(NashTaskAgent pid=13065)[0m [NashAgent:n01] Piazzato su edge-node-1 in 21.3ms | Nash=OK @ round 3 | utility=0.676
+[36m(NashTaskAgent pid=13255)[0m [NashAgent:n02] Creato. Policy=balanced, max_rounds=5, relaxation=20%
+[36m(ResourceAgent pid=12762)[0m [edge-node-4] CRDT sync: clock 9 -> 10[32m [repeated 69x across cluster][0m
+[36m(NashTaskAgent pid=13255)[0m 
+    n02: placed | rounds=1 | Nash=OK | lat=15.0ms
+[36m(NashTaskAgent pid=13292)[0m 
+    n03: placed | rounds=4 | Nash=OK | lat=21.6ms
+[36m(NashTaskAgent pid=13292)[0m 
+[36m(NashTaskAgent pid=13292)[0m 
+[36m(NashTaskAgent pid=13292)[0m 
+    n04: placed | rounds=4 | Nash=OK | lat=29.2ms
+[36m(NashTaskAgent pid=13329)[0m 
+[36m(NashTaskAgent pid=13329)[0m   <- REJECT           da edge-node-3
+[36m(NashTaskAgent pid=13329)[0m 
+[36m(NashTaskAgent pid=13329)[0m   <- REJECT           da edge-node-3
+[36m(NashTaskAgent pid=13329)[0m 
+[36m(NashTaskAgent pid=13329)[0m   <- REJECT           da edge-node-3
+[36m(NashTaskAgent pid=13329)[0m 
+[36m(NashTaskAgent pid=13329)[0m   <- REJECT           da edge-node-3
+    n05: placed | rounds=5 | Nash=fallback | lat=75.4ms
+[36m(NashTaskAgent pid=13370)[0m [NashAgent:n05] Creato. Policy=energy_first, max_rounds=5, relaxation=20%
+[36m(NashTaskAgent pid=13370)[0m 
+[36m(NashTaskAgent pid=13370)[0m 
+[36m(NashTaskAgent pid=13370)[0m 
+[36m(NashTaskAgent pid=13370)[0m 
+[36m(NashTaskAgent pid=13370)[0m 
+[36m(NashTaskAgent pid=13370)[0m [NashAgent:n05] Max rounds esaurito - uso best-available (fallback).
+[36m(NashTaskAgent pid=13370)[0m [NashAgent:n05] Piazzato su edge-node-3 in 31.7ms | Nash=fallback @ round 5 | utility=0.667
+[36m(NashTaskAgent pid=13413)[0m 
+    n06: placed | rounds=1 | Nash=OK | lat=15.2ms
+[36m(NashTaskAgent pid=13454)[0m 
+    n07: placed | rounds=4 | Nash=OK | lat=20.2ms
+[36m(NashTaskAgent pid=13454)[0m 
+[36m(NashTaskAgent pid=13454)[0m 
+[36m(NashTaskAgent pid=13454)[0m 
+    n08: placed | rounds=3 | Nash=OK | lat=20.7ms
+[36m(NashTaskAgent pid=13491)[0m 
+[36m(NashTaskAgent pid=13491)[0m 
+[36m(NashTaskAgent pid=13491)[0m 
+
+  Greedy: 8/8 piazzati, 6 SLA violations
+  Nash  : 8/8 piazzati, 5 SLA violations (su req. originali), rounds medi=3.1, utility=0.739
+  CRDT convergence: 71.5ms
+═════════════════════════════════════════════════════════════════
+  RIEPILOGO METRICHE
+═════════════════════════════════════════════════════════════════
+Scenario               PlacLat(ms)    A2A(ms)      SLA viol%    CRDT conv(ms)
+─────────────────────────────────────────────────────────────────
+S1 Baseline            25.7           5.0          20.0         73.7
+S2 High Load           16.7           3.6          40.0         70.6
+S3 Node Failure        44.2           32.2         33.3         71.6
+S4 Net Partition       14.6           4.4          0.0          77.3
+S5 Nash Equil.         23.5           0.0          62.5         71.5
+
+  Dati grezzi salvati: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/raw_results.json
+═════════════════════════════════════════════════════════════════
+  GENERAZIONE GRAFICI
+─────────────────────────────────────────────────────────────────
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_placement_latency.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_a2a_overhead.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_sla_violations.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_crdt_convergence.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/summary_dashboard.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_partition_divergence.png
+  Salvato: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/plot_nash_convergence.png
+═════════════════════════════════════════════════════════════════
+  FASE 4 COMPLETATA
+  Grafici in: /home/lvillari/distributed_systems/distribuited systems project/src/../results_nash_test/
+═════════════════════════════════════════════════════════════════
+[36m(ResourceAgent pid=13060)[0m [edge-node-1] ResourceAgent avviato: CPU=8.0, MEM=4096MB, LAT=15.0ms, ENERGY=0.30
+[36m(ResourceAgent pid=13059)[0m [edge-node-4] ACCEPT ricevuto per task=n08. CPU rimasta: 8.0, MEM: 6144MB[32m [repeated 7x across cluster][0m
+[36m(NashTaskAgent pid=13454)[0m [NashAgent:n07] Creato. Policy=latency_first, max_rounds=5, relaxation=20%[32m [repeated 3x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m [NashAgent:n08] Round 3/5 - CPU>=2.65, MEM>=678.6MB, LAT<=37.0ms[32m [repeated 22x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m   <- COUNTER_OFFER   da edge-node-1: score=0.667, lat=23.0ms[32m [repeated 55x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m   Non in equilibrio (C3_sla_stability). Rilascio requisiti.[32m [repeated 16x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m   <- PROPOSE         da edge-node-4: score=0.743, lat=20.7ms[32m [repeated 20x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m   Nash Equilibrium al round 3! Vincitore=edge-node-4, utility=0.813[32m [repeated 6x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m [NashAgent:n08] Piazzato su edge-node-4 in 25.6ms | Nash=OK @ round 3 | utility=0.813[32m [repeated 6x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m [NashAgent:n08] Creato. Policy=balanced, max_rounds=5, relaxation=20%[32m [repeated 2x across cluster][0m
+[36m(ResourceAgent pid=13060)[0m [edge-node-1] CRDT sync: clock 6 -> 7[32m [repeated 12x across cluster][0m
+[36m(NashTaskAgent pid=13491)[0m   <- REJECT           da edge-node-3[32m [repeated 9x across cluster][0m

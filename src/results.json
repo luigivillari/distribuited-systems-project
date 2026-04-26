@@ -1,27 +1,27 @@
 {
-  "timestamp": 1776351458.0087936,
+  "timestamp": 1777039779.6729913,
   "placements": [
     {
       "task_id": "task-01",
       "status": "placed",
       "placed_on": "edge-node-1",
       "policy": "latency_first",
-      "score": 0.9399306303587706,
-      "estimated_latency_ms": 21.478121172306732,
+      "score": 0.9428436907152226,
+      "estimated_latency_ms": 19.39736377484094,
       "energy_score": 0.3,
-      "placement_latency_ms": 12.393474578857422,
-      "proposals_received": 3,
-      "rejections_received": 1
+      "placement_latency_ms": 33.493757247924805,
+      "proposals_received": 4,
+      "rejections_received": 0
     },
     {
       "task_id": "task-02",
       "status": "placed",
       "placed_on": "edge-node-1",
       "policy": "energy_first",
-      "score": 0.7366884513620371,
-      "estimated_latency_ms": 16.557743189814474,
+      "score": 0.7344607433818928,
+      "estimated_latency_ms": 27.69628309053553,
       "energy_score": 0.3,
-      "placement_latency_ms": 19.37389373779297,
+      "placement_latency_ms": 27.03070640563965,
       "proposals_received": 4,
       "rejections_received": 0
     },
@@ -30,29 +30,34 @@
       "status": "placed",
       "placed_on": "edge-node-1",
       "policy": "balanced",
-      "score": 0.7498569754316844,
-      "estimated_latency_ms": 12.678780710394513,
+      "score": 0.7381387832735691,
+      "estimated_latency_ms": 27.32652090803863,
       "energy_score": 0.3,
-      "placement_latency_ms": 13.408660888671875,
+      "placement_latency_ms": 29.670000076293945,
       "proposals_received": 4,
       "rejections_received": 0
     },
     {
       "task_id": "task-04",
-      "status": "failed",
-      "reason": "no_proposals",
-      "placement_latency_ms": 5.220651626586914,
-      "proposals_received": 0
+      "status": "placed",
+      "placed_on": "edge-node-4",
+      "policy": "latency_first",
+      "score": 0.8753126351361336,
+      "estimated_latency_ms": 31.919546331333187,
+      "energy_score": 0.8,
+      "placement_latency_ms": 20.647764205932617,
+      "proposals_received": 2,
+      "rejections_received": 2
     },
     {
       "task_id": "task-05",
       "status": "placed",
       "placed_on": "edge-node-3",
       "policy": "energy_first",
-      "score": 0.6933944807644212,
-      "estimated_latency_ms": 83.02759617789366,
+      "score": 0.6938579015849247,
+      "estimated_latency_ms": 80.71049207537624,
       "energy_score": 0.2,
-      "placement_latency_ms": 13.350486755371094,
+      "placement_latency_ms": 28.681039810180664,
       "proposals_received": 4,
       "rejections_received": 0
     },
@@ -61,10 +66,10 @@
       "status": "placed",
       "placed_on": "edge-node-4",
       "policy": "balanced",
-      "score": 0.7417087288434525,
-      "estimated_latency_ms": 22.8640889456843,
+      "score": 0.7385097211434432,
+      "estimated_latency_ms": 26.86284857069595,
       "energy_score": 0.8,
-      "placement_latency_ms": 12.721776962280273,
+      "placement_latency_ms": 20.378589630126953,
       "proposals_received": 3,
       "rejections_received": 1
     },
@@ -73,26 +78,26 @@
       "status": "placed",
       "placed_on": "edge-node-4",
       "policy": "balanced",
-      "score": 0.7414482436498674,
-      "estimated_latency_ms": 23.18969543766572,
+      "score": 0.7418605726391786,
+      "estimated_latency_ms": 22.67428420102676,
       "energy_score": 0.8,
-      "placement_latency_ms": 9.607553482055664,
+      "placement_latency_ms": 23.474454879760742,
       "proposals_received": 1,
       "rejections_received": 3
     },
     {
       "task_id": "task-08",
       "status": "placed",
-      "placed_on": "edge-node-1",
+      "placed_on": "edge-node-4",
       "policy": "latency_first",
-      "score": 0.7956327951283584,
-      "estimated_latency_ms": 17.405146336886855,
-      "energy_score": 0.3,
-      "placement_latency_ms": 6.699800491333008,
-      "proposals_received": 1,
-      "rejections_received": 3
+      "score": 0.8687555360352943,
+      "estimated_latency_ms": 36.60318854621836,
+      "energy_score": 0.8,
+      "placement_latency_ms": 31.48818016052246,
+      "proposals_received": 3,
+      "rejections_received": 1
     }
   ],
   "crdt_convergence_pct": 100.0,
-  "gossip_duration_ms": 110.28122901916504
+  "gossip_duration_ms": 116.6844367980957
 }
