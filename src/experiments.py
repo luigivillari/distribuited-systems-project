@@ -47,7 +47,7 @@ from crdt_catalogue import ResourceCatalogue
 # Configurazione globale
 # ─────────────────────────────────────────────
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_nash_test")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 EDGE_NODES = [
@@ -302,16 +302,107 @@ def scenario_high_load() -> dict:
 # Scenario 3 — Node Failure
 # ─────────────────────────────────────────────
 
+def run_task_resilient(task_id: str, cpu: float, mem: float, max_lat: float,
+                       policy: PlacementPolicy, resource_agents: list) -> dict:
+    """
+    Come run_task, ma gestisce RayActorError per singoli agenti morti.
+    Restituisce il risultato normale più 'dead_nodes': lista degli id dei
+    nodi che non hanno risposto (crash rilevato via eccezione Ray).
+    """
+    req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
+                           max_latency_ms=max_lat, duration_sec=10,
+                           priority=2, task_type="generic")
+    cfp = make_cfp(f"task-{task_id}", task_id, req)
+
+    # Manda CFP a tutti — incluso eventuale nodo morto
+    t_cfp = time.time()
+    refs = [(a, a.receive_cfp.remote(cfp)) for a in resource_agents]
+
+    responses = []
+    dead_agents = []   # oggetti agente (non stringhe) — node_id risolto dal chiamante
+    for agent, ref in refs:
+        try:
+            resp = ray.get(ref)          # RayActorError immediato se l'actor è morto
+            responses.append(resp)
+        except ray.exceptions.RayActorError:
+            dead_agents.append(agent)   # salva l'oggetto, NON chiamare get_state sul morto
+            print(f"  [CRASH DETECTED] Un agente non risponde — RayActorError ricevuto")
+
+    t_responses = time.time()
+    a2a_overhead_ms = (t_responses - t_cfp) * 1000
+
+    # Fase scoring + accept (identica a run_task)
+    t_placement_start = time.time()
+    proposals = []
+    for resp in responses:
+        if resp and resp.msg_type in (MessageType.PROPOSE, MessageType.COUNTER_OFFER):
+            resp.offer.score = score_offer(resp.offer, policy)
+            proposals.append(resp)
+
+    status = "failed"
+    placed_on = None
+    estimated_latency_ms = None
+    sla_ok = False
+
+    if proposals:
+        best = max(proposals, key=lambda r: r.offer.score)
+        winner_idx = next(
+            i for i, a in enumerate(resource_agents)
+            if ray.get(a.get_state.remote())["node_id"] == best.sender_id
+        )
+        from protocol import make_accept, make_reject
+        accept_msg = make_accept(f"task-{task_id}", best.sender_id,
+                                 task_id, cfp.conversation_id)
+        ray.get(resource_agents[winner_idx].receive_accept.remote(accept_msg))
+
+        for resp in proposals:
+            if resp.sender_id != best.sender_id:
+                loser_idx = next(
+                    i for i, a in enumerate(resource_agents)
+                    if ray.get(a.get_state.remote())["node_id"] == resp.sender_id
+                )
+                resource_agents[loser_idx].receive_reject.remote(
+                    make_reject(f"task-{task_id}", resp.sender_id,
+                                task_id, cfp.conversation_id, "better_offer")
+                )
+
+        status = "placed"
+        placed_on = best.sender_id
+        estimated_latency_ms = best.offer.estimated_latency_ms
+        sla_ok = estimated_latency_ms <= max_lat
+
+    t_placement_end = time.time()
+    placement_latency_ms = (t_placement_end - t_placement_start) * 1000 + a2a_overhead_ms
+
+    return {
+        "task_id":              task_id,
+        "status":               status,
+        "placed_on":            placed_on,
+        "placement_latency_ms": placement_latency_ms,
+        "a2a_overhead_ms":      a2a_overhead_ms,
+        "estimated_latency_ms": estimated_latency_ms,
+        "max_latency_ms":       max_lat,
+        "sla_ok":               sla_ok,
+        "proposals_received":   len(proposals),
+        "dead_agents":          dead_agents,   # oggetti agente, non stringhe
+    }
+
+
 def scenario_node_failure() -> dict:
     """
-    Il nodo con più risorse (edge-node-4) va offline a metà esperimento.
-    I task successivi non lo vedono più tra i candidati.
-    Il CRDT registra il nodo come offline e propaga l'informazione.
+    S3 — Crash improvviso di edge-node-4 a metà esperimento.
+    Il nodo viene terminato con ray.kill() senza nessuna notifica preventiva
+    (nessun mark_offline, nessun gossip). I nodi sopravvissuti rilevano il
+    crash al primo CFP senza risposta (RayActorError) e aggiornano il
+    catalogo CRDT autonomamente tramite mark_node_offline_external().
     """
-    print("\n[S3] Node Failure — edge-node-4 va offline a metà")
+    print("\n[S3] Node Failure — crash improvviso di edge-node-4")
     agents = make_resource_agents()
 
-    # Prima metà: tutti i nodi disponibili
+    # Mappa agente -> node_id costruita PRIMA del crash (quando tutti sono vivi)
+    agent_id_map = {a: ray.get(a.get_state.remote())["node_id"] for a in agents}
+
+    # ── Prima metà: tutti e 4 i nodi disponibili ──────────────────
     tasks_pre = [
         ("f01", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
         ("f02", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
@@ -328,17 +419,18 @@ def scenario_node_failure() -> dict:
         print(f"    {tid}: {r['status']:6s} on {r['placed_on']} | "
               f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
 
-    # Simula il failure: mark offline nel CRDT e rimuovi dall'insieme attivo
-    print("\n  >>> edge-node-4 va OFFLINE <<<")
+    # ── Crash improvviso: ray.kill senza nessun avviso ────────────
+    print("\n  >>> CRASH IMPROVVISO — edge-node-4 terminato con ray.kill() <<<")
+    print("  I peer non sono stati notificati — scopriranno il crash al prossimo CFP")
     t_failure = time.time()
-    # Il nodo 4 (indice 3) marca se stesso offline nel catalogo
-    agents[3].mark_offline_self.remote()
-    active_agents = agents[:3]   # solo i primi 3 nodi
+    ray.kill(agents[3], no_restart=True)   # nodo morto — nessun gossip preventivo
 
-    # Propaga il failure via gossip
-    gossip_round(agents)
+    # I peer non sanno ancora che il nodo è morto.
+    # Mandiamo i CFP a tutti e 4, incluso il nodo morto.
+    active_agents = list(agents)
+    crash_detected = False
+    t_detect = None
 
-    # Seconda metà: solo 3 nodi
     tasks_post = [
         ("f06", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
         ("f07", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
@@ -347,20 +439,46 @@ def scenario_node_failure() -> dict:
         ("f10", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
     ]
 
-    print("  [POST-FAILURE] Solo 3 nodi attivi:")
+    print("  [POST-FAILURE] Invio CFP a tutti i nodi (crash non ancora rilevato)...")
     for (tid, cpu, mem, lat, pol) in tasks_post:
-        r = run_task(tid, cpu, mem, lat, pol, active_agents)
+        r = run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
         r["post_failure"] = True
-        results.append(r)
-        print(f"    {tid}: {r['status']:6s} on {r['placed_on']} | "
-              f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
 
-    t_conv = measure_convergence_time(agents)
-    print(f"  CRDT convergence dopo failure: {t_conv:.1f}ms")
+        # Prima rilevazione del crash
+        if r["dead_agents"] and not crash_detected:
+            crash_detected = True
+            t_detect = time.time()
+            print(f"\n  [FAILURE DETECTED] Crash rilevato {(t_detect - t_failure)*1000:.1f}ms "
+                  f"dopo il kill — aggiornamento CRDT in corso...")
+
+            for dead_agent in r["dead_agents"]:
+                # Usa la mappa pre-costruita: nessuna chiamata al nodo morto
+                dead_id = agent_id_map.get(dead_agent, "unknown")
+                survivors = [a for a in active_agents if a is not dead_agent]
+                # Ogni nodo sopravvissuto aggiorna il proprio catalogo CRDT
+                for survivor in survivors:
+                    survivor.mark_node_offline_external.remote(dead_id)
+                active_agents = survivors
+                print(f"  [CRDT UPDATE] {len(survivors)} nodi sopravvissuti hanno "
+                      f"marcato {dead_id} offline nel catalogo CRDT\n")
+
+        # Sostituisci ActorHandle (non serializzabile JSON) con booleano
+        crash_this_task = bool(r["dead_agents"])
+        r["crash_detected"] = crash_this_task
+        del r["dead_agents"]
+
+        results.append(r)
+        print(f"    {tid}: {r['status']:6s} on {r.get('placed_on') or '—'} | "
+              f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}"
+              + (" | CRASH RILEVATO" if crash_this_task else ""))
+
+    # Gossip finale tra i sopravvissuti per convergenza CRDT
+    t_conv = measure_convergence_time(active_agents) if len(active_agents) > 1 else 0.0
+    print(f"\n  CRDT convergence (nodi sopravvissuti): {t_conv:.1f}ms")
 
     metrics = compute_metrics(results)
     metrics["crdt_convergence_ms"] = t_conv
-    metrics["failure_detected_ms"] = (time.time() - t_failure) * 1000
+    metrics["failure_detected_ms"] = (t_detect - t_failure) * 1000 if t_detect else 0.0
     metrics["task_results"] = results
     return metrics
 

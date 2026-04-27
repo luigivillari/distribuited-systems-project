@@ -166,6 +166,14 @@ class ResourceAgent:
         self.catalogue.mark_offline(self.node_id)
         print(f"[{self.node_id}] Marcato OFFLINE nel catalogo CRDT")
 
+    def mark_node_offline_external(self, node_id: str):
+        """
+        Un nodo sopravvissuto marca un altro nodo come offline nel proprio
+        catalogo CRDT locale (usato dopo rilevamento crash via RayActorError).
+        """
+        self.catalogue.mark_offline(node_id)
+        print(f"[{self.node_id}] CRDT aggiornato: {node_id} marcato OFFLINE (crash rilevato)")
+
     def complete_task(self, task_id: str):
         if task_id in self.active_tasks:
             cpu_alloc, mem_alloc, start_t = self.active_tasks.pop(task_id)
